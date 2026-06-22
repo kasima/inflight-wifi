@@ -2570,7 +2570,7 @@ class TUI:
                     # plan/session state from the API is misconfigured on some
                     # carriers (Thai Airways reports PENDING with a plan active),
                     # so report connectivity as fact and leave the plan unknown.
-                    dev_str, dev_attr = "device connected, plan unknown", self._color(2)
+                    dev_str, dev_attr = "connected, plan unknown", self._color(2)
                 else:
                     dev_str, dev_attr = "plan unknown (no internet reachable)", self._color(3)
                 y = self._draw_kv(y, "Device", dev_str, dev_attr)
