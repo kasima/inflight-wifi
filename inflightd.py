@@ -688,12 +688,21 @@ class PanasonicProvider(Provider):
         return self.api_base
 
     def post_detect(self, info: SystemInfo, sig: NetworkSignals) -> None:
-        # Try DNS-search-domain wildcards for a portal URL if not already found
+        # Try DNS-search-domain wildcards for a portal URL if not already found.
+        # http first: the captive portal is served over http (the device isn't
+        # authenticated, so https throws cert errors) — on Thai Airways
+        # http://www.thaiskyconnect.aero serves the portal (200) while https
+        # answers 403. Accept only a real portal response (200 or a redirect to
+        # one), not any non-404 code: 403/5xx means "host is up but this isn't
+        # the portal", which is how the old https-only probe mislabeled it.
         if not info.portal_url and info.dns_domain:
             for sub in ("portal", "www", "wifi", "captive", "onboard"):
-                code, _, _ = http_get(f"https://{sub}.{info.dns_domain}/", timeout=3)
-                if code and code not in (0, 404):
-                    info.portal_url = f"https://{sub}.{info.dns_domain}"
+                for scheme in ("http", "https"):
+                    code, _, _ = http_get(f"{scheme}://{sub}.{info.dns_domain}/", timeout=3)
+                    if code == 200 or 300 <= code < 400:
+                        info.portal_url = f"{scheme}://{sub}.{info.dns_domain}"
+                        break
+                if info.portal_url:
                     break
         wisp, _ = http_get_json(f"{self.api_base}/exconnect/v1/wisp?lang=en")
         if wisp and "url" in wisp:
