@@ -297,6 +297,7 @@ class SystemInfo:
     local_ip: str = ""
     subnet: str = ""
     pac_wisp_url: str = ""
+    api_label: str = "PAC API"
 
 
 @dataclass
@@ -495,6 +496,9 @@ class Provider:
 
     name: str = "Unknown"
     hardware: str = ""
+    # Label for the api_base latency row in the UI. Defaults to "PAC API" so
+    # systems other than FlyNet keep the original wording (additive change).
+    api_label: str = "PAC API"
     discovery_domains: list[str] = []  # used as candidate hosts by --probe / --probe-deep
 
     def detect(self, sig: NetworkSignals) -> Optional[Match]:
@@ -533,6 +537,7 @@ class Provider:
 class PanasonicProvider(Provider):
     name = "Panasonic Avionics"
     hardware = "Matsushita/Panasonic Avionics"
+    api_label = "PAC API"
     api_base = "https://api.airpana.com/inflight/services"
     oui_prefixes = ["00:0d:2e"]  # Matsushita / Panasonic Avionics
 
@@ -686,6 +691,7 @@ class PanasonicProvider(Provider):
 class FlynetProvider(Provider):
     name = "Lufthansa Group FlyNet"
     hardware = "Lufthansa Systems BoardConnect (EAN / Inmarsat)"
+    api_label = "FlyNet API"
     # SSID substrings, matched loosely. macOS withholds the SSID without Location
     # permission, so this is corroborating — never required for a match.
     ssid_hints = ["flynet", "boardconnect", "telekom_flynet", "lufthansa",
@@ -891,6 +897,7 @@ def detect_system() -> SystemInfo:
 
     info.provider = best_provider.name
     info.hardware = best_match.hardware or best_provider.hardware
+    info.api_label = best_provider.api_label
     if best_match.airline:
         info.airline = best_match.airline
     if best_match.portal_url:
@@ -2218,7 +2225,7 @@ class TUI:
             gw_str = "unreachable"
             gw_attr = self._color(4, bold=True)
         y = self._draw_kv(y, "Gateway", gw_str, gw_attr)
-        y = self._draw_kv(y, "PAC API", f"{snap.api_latency_ms:.0f}ms", self._latency_attr(snap.api_latency_ms))
+        y = self._draw_kv(y, self.collector.sys_info.api_label, f"{snap.api_latency_ms:.0f}ms", self._latency_attr(snap.api_latency_ms))
         y = self._draw_kv(y, "Squid Proxy", f"{snap.proxy_latency_ms:.0f}ms", self._latency_attr(snap.proxy_latency_ms))
         y = self._draw_kv(y, "External (Google)", f"{snap.external_latency_ms:.0f}ms",
                           self._latency_attr(snap.external_latency_ms))
@@ -2313,7 +2320,7 @@ class TUI:
             gw_suffix = "HTTPS up" if snap.gateway_https_reachable else "HTTPS down"
             row("Gateway (ICMP)", gw.get("avg_ms", 0), gw.get("loss_pct", 0),
                 gw.get("min_ms", 0), gw.get("max_ms", 0), suffix=gw_suffix)
-        row("PAC API (HTTPS)", snap.api_latency_ms)
+        row(f"{self.collector.sys_info.api_label} (HTTPS)", snap.api_latency_ms)
         if snap.portal_latency_ms > 0:
             row("Portal (HTTPS)", snap.portal_latency_ms)
         row("Squid Proxy (HTTP)", snap.proxy_latency_ms)
@@ -2858,7 +2865,7 @@ def run_report(json_mode: bool = False):
     if gw:
         gw_https = f"{GREEN}HTTPS up{RESET}" if snap.gateway_https_reachable else f"{RED}HTTPS down{RESET}"
         print(f"  {DIM}{'Gateway (ICMP)':<22}{RESET} {_fmt_lat(gw.get('avg_ms',0))}  loss {gw.get('loss_pct',0):.1f}%  {gw_https}")
-    print(f"  {DIM}{'PAC API (HTTPS)':<22}{RESET} {_fmt_lat(snap.api_latency_ms)}")
+    print(f"  {DIM}{(sys_info.api_label + ' (HTTPS)'):<22}{RESET} {_fmt_lat(snap.api_latency_ms)}")
     print(f"  {DIM}{'Squid Proxy (HTTP)':<22}{RESET} {_fmt_lat(snap.proxy_latency_ms)}")
     print(f"  {DIM}{'External (HTTPS)':<22}{RESET} {_fmt_lat(snap.external_latency_ms)}")
     print(f"  {DIM}{'DNS (google.com)':<22}{RESET} {_fmt_lat(snap.dns_resolve_ms)}")
