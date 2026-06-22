@@ -1958,7 +1958,10 @@ class TUI:
         self._collect_thread: Optional[threading.Thread] = None
         self._scroll_offset = 0
 
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)  # ERRs on terminals that can't hide the cursor
+        except curses.error:
+            pass
         curses.use_default_colors()
         self._init_colors()
         self.scr.nodelay(True)
