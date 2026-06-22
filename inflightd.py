@@ -14,6 +14,7 @@ Usage:
 import argparse
 import collections
 import curses
+import ipaddress
 import json
 import math
 import os
@@ -27,6 +28,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 import math
@@ -94,6 +96,29 @@ def http_get_json(url: str, timeout: float = 5.0) -> tuple[Optional[dict], float
         except json.JSONDecodeError:
             pass
     return None, elapsed
+
+
+def resolves_private(host: str) -> bool:
+    """True if host resolves to a private/loopback/link-local address.
+
+    Onboard IFE hosts are DNS-hijacked to RFC1918 space (e.g. 10.x); the same
+    hostnames resolve to routable public IPs on the ground. Gating network
+    probes on this keeps detection from beaconing to (or stalling on) public
+    servers when you're not actually on the aircraft."""
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError, UnicodeError):
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +450,11 @@ def _detect_captive_portal() -> tuple[str, str, str]:
                     portal_url = final_url
                 elif "captive.apple.com" in test_url:
                     body = resp.read(4096).decode("utf-8", errors="replace")
-                    # Apple's unmolested response is exactly "<TITLE>Success</TITLE>".
-                    if "Success" not in body:
+                    # Apple's unmolested body is exactly
+                    # "<HTML><HEAD><TITLE>Success</TITLE></HEAD>...". Match that
+                    # marker, not a bare "Success", so a portal page that merely
+                    # contains the word isn't treated as the genuine response.
+                    if "<TITLE>Success</TITLE>" not in body:
                         portal_url = final_url or test_url
         except urllib.error.HTTPError as e:
             # 302/303 redirects to portal
@@ -708,10 +736,14 @@ class FlynetProvider(Provider):
     # BoardConnect's DHCP gateway runs no web server — the portal and internet
     # live on other onboard hosts — so a silent gateway is not an outage.
     gateway_serves_web = False
-    # SSID substrings, matched loosely. macOS withholds the SSID without Location
-    # permission, so this is corroborating — never required for a match.
-    ssid_hints = ["flynet", "boardconnect", "telekom_flynet", "lufthansa",
-                  "eurowings", "austrian", "swiss", "edelweiss"]
+    # Distinctive SSID tokens, matched whole (not as substrings) so generic
+    # names don't false-positive — e.g. "Swisscom"/"Swiss Re" must NOT look like
+    # the airline "SWISS", and a German "Telekom" home router must NOT match.
+    # Bare airline names (swiss/austrian/lufthansa) are intentionally excluded;
+    # the captive redirect and DNS search domain cover those. macOS withholds
+    # the SSID without Location permission, so this is corroborating, not
+    # required. ("Telekom_FlyNet" still matches via its "flynet" token.)
+    ssid_tokens = {"flynet", "boardconnect", "eurowings", "edelweiss"}
     # Onboard hosts the aircraft DNS points at a private server. www first: the
     # apex 302-redirects, only www serves the app + API with a 200.
     api_base_candidates = [
@@ -734,6 +766,13 @@ class FlynetProvider(Provider):
         "LH": "Lufthansa", "LX": "SWISS", "OS": "Austrian Airlines",
         "EW": "Eurowings", "WK": "Edelweiss Air", "EN": "Air Dolomiti",
     }
+    _FLIGHT_TTL = 5.0  # seconds; coalesces the per-cycle flight + connectivity reads
+
+    _PROBE_UNSET = object()  # sentinel: api-base probe hasn't run yet this process
+
+    def __init__(self):
+        self._probed_base = self._PROBE_UNSET
+        self._flight_cache = None  # (monotonic_ts, api_base, data)
 
     def detect(self, sig: NetworkSignals) -> Optional[Match]:
         confidence = 0
@@ -751,9 +790,10 @@ class FlynetProvider(Provider):
         dns = sig.dns_domain.lower()
         if any(d in dns for d in ("flynet", "telekom", "lufthansa", "boardconnect")):
             confidence += 40
-        # SSID (loose substring; may be empty under macOS privacy).
+        # SSID — match whole tokens, not substrings (may be empty under macOS
+        # privacy). Tokenizing stops "Swisscom" from matching the airline name.
         ssid = sig.ssid.lower().strip()
-        if ssid and any(h in ssid for h in self.ssid_hints):
+        if ssid and set(re.split(r"[^a-z0-9]+", ssid)) & self.ssid_tokens:
             confidence += 50
         # ARP hostname hint.
         for c in sig.arp_clients:
@@ -764,7 +804,11 @@ class FlynetProvider(Provider):
         if sig.gateway_mac_oui in self.oui_prefixes:
             confidence += 25
         # Last resort: nothing cheap matched, so ask the onboard flight API
-        # directly. Definitive but costs a request, so it's gated to confidence 0.
+        # directly. Definitive, but it touches the network, so it's gated to
+        # confidence 0 AND to hosts that resolve to a private IP (see
+        # _probe_api_base) — that keeps it from beaconing to public Lufthansa /
+        # SWISS servers, or stalling on a blackholed captive, when you're not on
+        # the aircraft.
         if confidence == 0 and self._probe_api_base() is not None:
             confidence += 60
         if confidence == 0:
@@ -775,11 +819,22 @@ class FlynetProvider(Provider):
         return self._probe_api_base()
 
     def _probe_api_base(self) -> Optional[str]:
-        """Return the first onboard host whose flight API returns a flight JSON."""
+        """First onboard host (resolving to a private IP) whose flight API
+        returns a flight JSON. Cached, so detect() and discover_api_base()
+        don't each pay a full sweep. Public-resolving candidates are skipped:
+        the onboard hosts are DNS-hijacked to RFC1918 space on the aircraft."""
+        if self._probed_base is not self._PROBE_UNSET:
+            return self._probed_base
+        result = None
         for base in self.api_base_candidates:
+            host = urllib.parse.urlsplit(base).hostname
+            if not resolves_private(host):
+                continue
             if self._flight_json(base) is not None:
-                return base
-        return None
+                result = base
+                break
+        self._probed_base = result
+        return result
 
     def post_detect(self, info: SystemInfo, sig: NetworkSignals) -> None:
         if not info.portal_url:
@@ -788,6 +843,20 @@ class FlynetProvider(Provider):
     # ---- flight + connectivity both come from /fapi/flightData ----
 
     def _flight_json(self, api_base: str) -> Optional[dict]:
+        # fetch_flight and fetch_connectivity both want this payload each cycle;
+        # memoize briefly so one collect cycle hits the onboard API once, not
+        # twice (and both reads see a consistent snapshot). TTL < collect
+        # interval, so the next cycle still refreshes.
+        cached = self._flight_cache
+        if cached is not None:
+            ts, base, data = cached
+            if base == api_base and (time.monotonic() - ts) < self._FLIGHT_TTL:
+                return data
+        data = self._fetch_flight_json(api_base)
+        self._flight_cache = (time.monotonic(), api_base, data)
+        return data
+
+    def _fetch_flight_json(self, api_base: str) -> Optional[dict]:
         for path in self.flight_paths:
             data, _ = http_get_json(f"{api_base}{path}", timeout=4)
             if isinstance(data, dict) and (data.get("flightNumber") or data.get("flightPhase")
@@ -825,10 +894,17 @@ class FlynetProvider(Provider):
 
     @staticmethod
     def _hhmm_to_min(value) -> int:
-        """Parse BoardConnect "HH:MM" duration strings (e.g. "02:05" -> 125)."""
+        """Parse a BoardConnect duration to minutes. Handles "HH:MM" (e.g.
+        "02:05" -> 125) and bare numbers (some fleet builds send integer
+        minutes, e.g. 125 -> 125). Returns 0 for anything unparseable."""
+        if value is None:
+            return 0
+        s = str(value).strip()
         try:
-            h, m = str(value).split(":")[:2]
-            return int(h) * 60 + int(m)
+            if ":" in s:
+                h, m = s.split(":")[:2]
+                return int(h) * 60 + int(m)
+            return int(float(s))  # bare numeric: already minutes
         except (ValueError, AttributeError):
             return 0
 
@@ -860,10 +936,12 @@ class FlynetProvider(Provider):
 
         fd.distance_to_dest_nm = int(self._num(data, "distDest"))
         fd.time_to_dest_min = self._hhmm_to_min(data.get("timeDest"))
-        # No progress % in the payload — derive it from elapsed vs remaining time.
+        # No progress % in the payload — derive it from elapsed vs remaining
+        # time, but only when both are present. Otherwise a missing field would
+        # read as 0% mid-flight or 100% early, so leave it at 0 (unknown).
         elapsed = self._hhmm_to_min(data.get("elapsedFlightTime"))
-        total = elapsed + fd.time_to_dest_min
-        fd.distance_covered_pct = int(round(100 * elapsed / total)) if total else 0
+        if elapsed > 0 and fd.time_to_dest_min > 0:
+            fd.distance_covered_pct = int(round(100 * elapsed / (elapsed + fd.time_to_dest_min)))
         fd.flight_phase = str(data.get("flightPhase") or "")
         fd.estimated_arrival_utc = str(data.get("eta") or dest.get("localTimeAtArrival") or "")
         fd.current_utc_date = str(data.get("utc") or "")
