@@ -410,9 +410,22 @@ def _detect_captive_portal() -> tuple[str, str, str]:
                 via = resp.headers.get("Via", "")
                 if "squid" in via.lower():
                     proxy_info = f"Squid ({via.split(',')[-1].strip()})"
+                # urlopen transparently follows redirects, so on a hijacked
+                # network the captive probe lands ON the portal page and the
+                # Location header is already consumed — the portal is the final
+                # URL. (FlyNet/BoardConnect 302s captive.apple.com to
+                # captive.boardconnect.aero.) Fall back to a body check for
+                # portals that MITM the probe at the same URL.
                 location = resp.headers.get("Location", "")
                 if location and location != test_url:
                     portal_url = location
+                elif final_url and final_url.rstrip("/") != test_url.rstrip("/"):
+                    portal_url = final_url
+                elif "captive.apple.com" in test_url:
+                    body = resp.read(4096).decode("utf-8", errors="replace")
+                    # Apple's unmolested response is exactly "<TITLE>Success</TITLE>".
+                    if "Success" not in body:
+                        portal_url = final_url or test_url
         except urllib.error.HTTPError as e:
             # 302/303 redirects to portal
             location = e.headers.get("Location", "") if e.headers else ""
@@ -656,110 +669,126 @@ class PanasonicProvider(Provider):
 
 
 # ---------------------------------------------------------------------------
-# Lufthansa Group FlyNet — SWISS, Lufthansa, Austrian, Eurowings
-# (Detection + parser stubs; not yet verified on a live aircraft.)
+# Lufthansa Group FlyNet — Lufthansa, SWISS, Austrian, Eurowings, Edelweiss
+#
+# Hardware: Lufthansa Systems / Lufthansa Technik "BoardConnect" — the FlyNet®
+# web app (an Angular SPA using the "maui-components" design system). Short-haul
+# Continental aircraft ride the European Aviation Network (EAN: Deutsche Telekom
+# LTE-to-ground + Inmarsat S-band); long-haul uses Ka-band satellite.
+#
+# Verified live on Lufthansa, running BoardConnect OS 8 (FlyNet frontend
+# v0.35.4). The onboard DNS hijacks www.lufthansa-flynet.com to a private
+# server (10.x) and Apple's captive probe 302-redirects to
+# captive.boardconnect.aero. Flight + position + connectivity all come from
+# one endpoint: GET /fapi/flightData.
 # ---------------------------------------------------------------------------
 
 class FlynetProvider(Provider):
     name = "Lufthansa Group FlyNet"
-    hardware = "Deutsche Telekom / EAN or Inmarsat Ka"
-    ssids = ["telekom_flynet", "flynet", "lufthansa flynet", "swiss connect", "swissconnect"]
-    discovery_domains = ["lufthansa-flynet.com", "flynet.lufthansa.com",
-                         "wlan.onboard.lufthansa.com",
-                         "swissconnect.com", "www.swissconnect.com",
-                         "portal.swissconnect.com", "api.swissconnect.com"]
+    hardware = "Lufthansa Systems BoardConnect (EAN / Inmarsat)"
+    # SSID substrings, matched loosely. macOS withholds the SSID without Location
+    # permission, so this is corroborating — never required for a match.
+    ssid_hints = ["flynet", "boardconnect", "telekom_flynet", "lufthansa",
+                  "eurowings", "austrian", "swiss", "edelweiss"]
+    # Onboard hosts the aircraft DNS points at a private server. www first: the
+    # apex 302-redirects, only www serves the app + API with a 200.
     api_base_candidates = [
         "https://www.lufthansa-flynet.com",
+        "https://lufthansa-flynet.com",
         "https://wlan.onboard.lufthansa.com",
         "https://flynet.lufthansa.com",
+        "https://www.swissconnect.com",
     ]
-    flight_paths = [
-        "/api/flightData", "/api/v1/flightData",
-        "/api/v1/flight-info", "/api/flight", "/flightInfo",
-    ]
-    connectivity_paths = ["/api/connectivity", "/api/v1/connectivity",
-                          "/api/status", "/api/v1/status", "/api/network"]
+    discovery_domains = ["captive.boardconnect.aero", "boardconnect.aero",
+                         "www.lufthansa-flynet.com", "lufthansa-flynet.com",
+                         "wlan.onboard.lufthansa.com", "flynet.lufthansa.com",
+                         "www.swissconnect.com", "swissconnect.com"]
+    # /fapi = onboard "flight API". flightData is the canonical path; the others
+    # are tolerated in case the BoardConnect build differs across the fleet.
+    flight_paths = ["/fapi/flightData", "/fapi/flightdata", "/flightdata"]
+    # Gateway MAC OUI observed once on EAN hardware — weak, corroborating only.
+    oui_prefixes = ["00:e0:4b"]
     airlines_by_prefix = {
-        "LX": "SWISS", "LH": "Lufthansa", "OS": "Austrian Airlines",
-        "EW": "Eurowings", "WK": "Edelweiss Air",
+        "LH": "Lufthansa", "LX": "SWISS", "OS": "Austrian Airlines",
+        "EW": "Eurowings", "WK": "Edelweiss Air", "EN": "Air Dolomiti",
     }
 
     def detect(self, sig: NetworkSignals) -> Optional[Match]:
         confidence = 0
         portal_url = ""
-        if sig.ssid.lower().strip() in self.ssids:
+        # Captive-portal redirect to BoardConnect is the strongest signal that
+        # needs no SSID / Location permission. captive.apple.com 302s here.
+        pu = sig.portal_url.lower()
+        if "boardconnect.aero" in pu:
             confidence += 50
-        dns = sig.dns_domain.lower()
-        if any(d in dns for d in ["flynet", "telekom", "lufthansa"]):
+            portal_url = sig.portal_url
+        elif any(d in pu for d in ("flynet", "lufthansa", "swissconnect")):
             confidence += 40
-        if sig.portal_url:
-            for d in self.discovery_domains:
-                if d in sig.portal_url:
-                    confidence += 40
-                    portal_url = sig.portal_url
-                    break
-
+            portal_url = sig.portal_url
+        # DNS search domain (often absent — the observed EAN aircraft pushed none).
+        dns = sig.dns_domain.lower()
+        if any(d in dns for d in ("flynet", "telekom", "lufthansa", "boardconnect")):
+            confidence += 40
+        # SSID (loose substring; may be empty under macOS privacy).
+        ssid = sig.ssid.lower().strip()
+        if ssid and any(h in ssid for h in self.ssid_hints):
+            confidence += 50
+        # ARP hostname hint.
+        for c in sig.arp_clients:
+            if any(h in c.get("hostname", "").lower() for h in ("boardconnect", "flynet")):
+                confidence += 20
+                break
+        # Gateway MAC OUI (weak; one observation on EAN hardware).
+        if sig.gateway_mac_oui in self.oui_prefixes:
+            confidence += 25
+        # Last resort: nothing cheap matched, so ask the onboard flight API
+        # directly. Definitive but costs a request, so it's gated to confidence 0.
+        if confidence == 0 and self._probe_api_base() is not None:
+            confidence += 60
         if confidence == 0:
             return None
         return Match(confidence=min(confidence, 100), portal_url=portal_url)
 
     def discover_api_base(self, sig: NetworkSignals) -> Optional[str]:
+        return self._probe_api_base()
+
+    def _probe_api_base(self) -> Optional[str]:
+        """Return the first onboard host whose flight API returns a flight JSON."""
         for base in self.api_base_candidates:
-            for path in ("/api/flightData", "/api/v1/flightData"):
-                code, _, _ = http_get(f"{base}{path}", timeout=3)
-                if code == 200:
-                    return base
+            if self._flight_json(base) is not None:
+                return base
         return None
 
     def post_detect(self, info: SystemInfo, sig: NetworkSignals) -> None:
-        # Fall back to any reachable known portal if we still don't have one
         if not info.portal_url:
-            for domain in self.discovery_domains:
-                code, _, _ = http_get(f"https://{domain}/", timeout=5)
-                if code and code != 0:
-                    info.portal_url = f"https://{domain}"
-                    break
+            info.portal_url = sig.portal_url or "https://captive.boardconnect.aero"
+
+    # ---- flight + connectivity both come from /fapi/flightData ----
+
+    def _flight_json(self, api_base: str) -> Optional[dict]:
+        for path in self.flight_paths:
+            data, _ = http_get_json(f"{api_base}{path}", timeout=4)
+            if isinstance(data, dict) and (data.get("flightNumber") or data.get("flightPhase")
+                                           or data.get("aircraftRegistration")):
+                return data
+        return None
 
     def fetch_flight(self, api_base: str) -> Optional[FlightData]:
-        for path in self.flight_paths:
-            data, _ = http_get_json(f"{api_base}{path}")
-            if data:
-                return self._parse_flight(data)
-
-        # Some FlyNet portals embed flight data in the main page as JSON
-        code, body, _ = http_get(api_base, timeout=5)
-        if code == 200 and body:
-            for m in re.finditer(r'(?:flightData|flightInfo|flight_data)\s*[=:]\s*(\{[^;]{20,2000}\})', body):
-                try:
-                    data = json.loads(m.group(1))
-                    fd = self._parse_flight(data)
-                    if fd and fd.flight_number:
-                        return fd
-                except (json.JSONDecodeError, ValueError):
-                    continue
-        return None
+        data = self._flight_json(api_base)
+        return self._parse_flight(data) if data else None
 
     def fetch_connectivity(self, api_base: str) -> Optional[ConnectivityStatus]:
-        for path in self.connectivity_paths:
-            data, _ = http_get_json(f"{api_base}{path}")
-            if data:
-                cs = ConnectivityStatus()
-                cs.internet_connectivity = bool(data.get("connected") or data.get("online")
-                                                or data.get("internetAvailable") or True)
-                cs.global_conn_enabled = bool(data.get("enabled") or data.get("serviceAvailable")
-                                              or True)
-                return cs
-        # If portal is reachable at all, connectivity is likely up
-        code, _, _ = http_get(api_base, timeout=3)
-        if code and code < 500:
-            cs = ConnectivityStatus()
-            cs.internet_connectivity = True
-            cs.global_conn_enabled = True
-            return cs
-        return None
+        data = self._flight_json(api_base)
+        if not data:
+            return None
+        cs = ConnectivityStatus()
+        cs.internet_connectivity = bool(data.get("internetAvailable"))
+        # IFCinstalled = in-flight connectivity hardware present and provisioned.
+        cs.global_conn_enabled = bool(data.get("IFCinstalled", data.get("internetAvailable")))
+        return cs
 
     def airline_from_flight_number(self, flight_number: str) -> str:
-        return self.airlines_by_prefix.get(flight_number[:2], "")
+        return self.airlines_by_prefix.get(flight_number[:2].upper(), "")
 
     @staticmethod
     def _num(d: dict, *keys) -> float:
@@ -772,47 +801,51 @@ class FlynetProvider(Provider):
                     continue
         return 0
 
+    @staticmethod
+    def _hhmm_to_min(value) -> int:
+        """Parse BoardConnect "HH:MM" duration strings (e.g. "02:05" -> 125)."""
+        try:
+            h, m = str(value).split(":")[:2]
+            return int(h) * 60 + int(m)
+        except (ValueError, AttributeError):
+            return 0
+
     def _parse_flight(self, data: dict) -> Optional[FlightData]:
-        """Parse FlyNet flight data — handles multiple known JSON shapes."""
+        """Parse a BoardConnect /fapi/flightData payload. Field names verified
+        live against a FlyNet (BoardConnect) aircraft — see the header comment."""
         if not data:
             return None
+        orig = data.get("orig") if isinstance(data.get("orig"), dict) else {}
+        dest = data.get("dest") if isinstance(data.get("dest"), dict) else {}
         fd = FlightData()
-        fd.flight_number = (data.get("flightNumber") or data.get("flight_number")
-                            or data.get("fn") or "")
-        fd.departure_iata = (data.get("departureAirportCode") or data.get("departure")
-                             or data.get("dep") or data.get("origin", {}).get("code", "") or "")
-        fd.destination_iata = (data.get("arrivalAirportCode") or data.get("destination")
-                               or data.get("dst") or data.get("destination", {}).get("code", "") or "")
-        fd.aircraft_type = data.get("aircraftType") or data.get("aircraft_type") or ""
-        fd.tail_number = data.get("tailNumber") or data.get("registration") or ""
+        fd.flight_number = str(data.get("flightNumber") or "")
+        fd.departure_iata = str(orig.get("code") or "")
+        fd.destination_iata = str(dest.get("code") or "")
+        fd.aircraft_type = str(data.get("aircraftType") or "")
+        fd.tail_number = str(data.get("aircraftRegistration") or "")
 
-        fd.ground_speed_kts = int(self._num(data, "groundSpeed", "ground_speed", "speed") or 0)
-        fd.altitude_ft = int(self._num(data, "altitude", "altitudeFeet") or 0)
-        fd.heading_deg = int(self._num(data, "heading", "trueHeading") or 0)
-        fd.outside_temp_c = int(self._num(data, "outsideTemperature", "oat", "temperature") or 0)
+        fd.ground_speed_kts = int(self._num(data, "groundSpeed"))
+        fd.altitude_ft = int(self._num(data, "altitude"))
+        fd.heading_deg = int(self._num(data, "heading"))
+        fd.outside_temp_c = int(self._num(data, "temperature"))
 
-        fd.latitude = self._num(data, "latitude", "lat") or 0.0
-        fd.longitude = self._num(data, "longitude", "lng", "lon") or 0.0
-        pos = data.get("position") or data.get("currentPosition") or {}
-        if isinstance(pos, dict):
-            fd.latitude = fd.latitude or self._num(pos, "latitude", "lat") or 0.0
-            fd.longitude = fd.longitude or self._num(pos, "longitude", "lng", "lon") or 0.0
+        fd.latitude = self._num(data, "lat")
+        fd.longitude = self._num(data, "lon")
+        fd.departure_lat = self._num(orig, "lat")
+        fd.departure_lon = self._num(orig, "lon")
+        fd.destination_lat = self._num(dest, "lat")
+        fd.destination_lon = self._num(dest, "lon")
 
-        fd.time_to_dest_min = int(self._num(data, "timeToDestination", "remainingTime",
-                                           "estimatedTimeRemaining") or 0)
-        fd.distance_to_dest_nm = int(self._num(data, "distanceToDestination", "remainingDistance") or 0)
-        fd.distance_covered_pct = int(self._num(data, "progress", "percentComplete") or 0)
-        fd.estimated_arrival_utc = (data.get("estimatedArrival") or data.get("eta")
-                                    or data.get("arrivalTime") or "")
-
-        dep = data.get("departureAirport") or data.get("origin") or {}
-        if isinstance(dep, dict):
-            fd.departure_lat = self._num(dep, "latitude", "lat") or 0.0
-            fd.departure_lon = self._num(dep, "longitude", "lng", "lon") or 0.0
-        dst = data.get("arrivalAirport") or data.get("destination") or {}
-        if isinstance(dst, dict) and dst.get("latitude") is not None:
-            fd.destination_lat = self._num(dst, "latitude", "lat") or 0.0
-            fd.destination_lon = self._num(dst, "longitude", "lng", "lon") or 0.0
+        fd.distance_to_dest_nm = int(self._num(data, "distDest"))
+        fd.time_to_dest_min = self._hhmm_to_min(data.get("timeDest"))
+        # No progress % in the payload — derive it from elapsed vs remaining time.
+        elapsed = self._hhmm_to_min(data.get("elapsedFlightTime"))
+        total = elapsed + fd.time_to_dest_min
+        fd.distance_covered_pct = int(round(100 * elapsed / total)) if total else 0
+        fd.flight_phase = str(data.get("flightPhase") or "")
+        fd.estimated_arrival_utc = str(data.get("eta") or dest.get("localTimeAtArrival") or "")
+        fd.current_utc_date = str(data.get("utc") or "")
+        fd.weight_on_wheels = bool(data.get("weightOnWheels"))
         return fd
 
 

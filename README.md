@@ -8,7 +8,7 @@ Inflight WiFi is frequently flaky in ways that are hard to diagnose. Is the sate
 
 ## What it does
 
-- **Auto-detects** the inflight WiFi system (currently Panasonic Avionics; FlyNet stubs in place but unverified)
+- **Auto-detects** the inflight WiFi system (currently Panasonic Avionics and Lufthansa Group FlyNet / BoardConnect)
 - **Pulls live flight data** straight from the IFEC system: flight number, aircraft type and tail number, route, speed, altitude, heading, OAT, time/distance to destination, position (lat/lon)
 - **Plots your position** on an ASCII world map with the great-circle route (proper spherical interpolation, not a straight line)
 - **Measures the network** at every layer: gateway ICMP/HTTPS, onboard API, Squid proxy, external HTTPS, DNS resolution, throughput
@@ -21,7 +21,7 @@ Inflight WiFi is frequently flaky in ways that are hard to diagnose. Is the sate
 | System                | Airlines                              | Status                              |
 | ---                   | ---                                   | ---                                 |
 | Panasonic Avionics    | TAP, SWISS, KLM, Air France           | Verified on TAP and SWISS; full API mapped |
-| Lufthansa FlyNet      | LH, OS, EW, WK                        | Detection + parser stubs, **not yet verified** on a live aircraft |
+| Lufthansa FlyNet (BoardConnect) | LH, LX, OS, EW, WK          | Verified live on Lufthansa; `/fapi/flightData` mapped end-to-end |
 
 Everything else lands as `Unknown` — `--probe-deep` is built to help map new systems quickly.
 
@@ -82,7 +82,8 @@ In rough order of confidence:
 2. **DNS search domain** — `onboardwifi` (TAP), `swissconnectforguests` (SWISS), `flynet`/`telekom`/`lufthansa` (FlyNet).
 3. **Server header on the gateway** — `PAC Web Server` is a dead giveaway.
 4. **TLS certificate SAN on the gateway** — Panasonic gateways present a cert for `api.airpana.com`.
-5. **ARP-table hostnames** — `flytap`, `klm`, `airfrance`, etc.
+5. **Captive-portal redirect** — Apple's captive probe 302s to `captive.boardconnect.aero` on Lufthansa Group FlyNet (BoardConnect). This needs no SSID or Location permission, so it works even when macOS withholds the network name.
+6. **ARP-table hostnames** — `flytap`, `klm`, `airfrance`, etc.
 
 If any of these match, the rest of the Panasonic codepath kicks in and you get full flight + connectivity + WISP data.
 
@@ -94,7 +95,7 @@ Single file, single process, no external dependencies.
 - **`Provider`** — base class. Each inflight system is a subclass implementing `detect()` (returns a `Match` with a confidence score), `discover_api_base()`, and `fetch_flight()` / `fetch_connectivity()` / `fetch_device_state()` / `fetch_wisp_products()`. Defaults return `None`/`[]`, so providers only override what they expose.
 - **`PROVIDERS`** — registry list. `detect_system()` runs each provider against the gathered signals, picks the highest-confidence `Match` above `DETECT_FLOOR` (30), and stamps the result onto `SystemInfo`.
 - **`PanasonicProvider`** — TAP, KLM, Air France, SWISS. Constants (`oui_prefixes`, `api_base`) live as class attributes. API: `api.airpana.com/inflight/services/...`.
-- **`FlynetProvider`** — Lufthansa Group stubs. Schema-tolerant parser that handles multiple JSON shapes; probes several candidate API bases since FlyNet's portal hostname varies.
+- **`FlynetProvider`** — Lufthansa Group FlyNet, running Lufthansa Systems **BoardConnect**. Detects via the captive-portal redirect to `captive.boardconnect.aero` (no SSID needed), then reads flight, position, and connectivity from one onboard endpoint: `GET /fapi/flightData` on `www.lufthansa-flynet.com` (DNS-hijacked to a private aircraft IP). Verified live on Lufthansa (FlyNet frontend v0.35.4).
 - **`DataCollector`** — ring buffer of `Snapshot`s, satellite coverage event tracker. Dispatches through `self.provider.fetch_*()` — no per-provider branching.
 - **`render_map()`** — ASCII world map with simplified coastline polylines and `great_circle_point()` interpolation.
 - **`TUI`** — curses front-end, threaded background collection, six views.
