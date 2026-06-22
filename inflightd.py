@@ -298,6 +298,7 @@ class SystemInfo:
     subnet: str = ""
     pac_wisp_url: str = ""
     api_label: str = "PAC API"
+    gateway_na_label: str = ""
 
 
 @dataclass
@@ -505,6 +506,10 @@ class Provider:
     # server (the portal lives on other onboard hosts) set this False, so a
     # silent gateway with working services is reported as info instead.
     gateway_serves_web: bool = True
+    # Concise display name for UI labels (falls back to name if unset). Used to
+    # build the gateway's calm "n/a on {short_name}" status, shown in place of
+    # the red "HTTPS down"/"unreachable" when gateway_serves_web is False.
+    short_name: str = ""
     discovery_domains: list[str] = []  # used as candidate hosts by --probe / --probe-deep
 
     def detect(self, sig: NetworkSignals) -> Optional[Match]:
@@ -542,6 +547,7 @@ class Provider:
 
 class PanasonicProvider(Provider):
     name = "Panasonic Avionics"
+    short_name = "Panasonic"
     hardware = "Matsushita/Panasonic Avionics"
     api_label = "PAC API"
     api_base = "https://api.airpana.com/inflight/services"
@@ -698,6 +704,7 @@ class FlynetProvider(Provider):
     name = "Lufthansa Group FlyNet"
     hardware = "Lufthansa Systems BoardConnect (EAN / Inmarsat)"
     api_label = "FlyNet API"
+    short_name = "FlyNet"
     # BoardConnect's DHCP gateway runs no web server — the portal and internet
     # live on other onboard hosts — so a silent gateway is not an outage.
     gateway_serves_web = False
@@ -907,6 +914,10 @@ def detect_system() -> SystemInfo:
     info.provider = best_provider.name
     info.hardware = best_match.hardware or best_provider.hardware
     info.api_label = best_provider.api_label
+    # A gateway that runs no web server is silent by design — give the UI a calm
+    # "n/a on {provider}" label instead of a red "unreachable"/"HTTPS down".
+    if not best_provider.gateway_serves_web:
+        info.gateway_na_label = f"n/a on {best_provider.short_name or best_provider.name}"
     if best_match.airline:
         info.airline = best_match.airline
     if best_match.portal_url:
@@ -2236,6 +2247,11 @@ class TUI:
             else:
                 gw_str = "HTTPS reachable"
                 gw_attr = self._color(2)
+        elif self.collector.sys_info.gateway_na_label:
+            # Gateway is silent by design on this system — show a calm label
+            # instead of a red "unreachable"/"HTTPS down".
+            gw_str = self.collector.sys_info.gateway_na_label
+            gw_attr = curses.A_DIM
         elif gw_ms > 0:
             gw_str = f"{gw_ms:.0f}ms (ICMP, HTTPS down)"
             gw_attr = self._color(3)
@@ -2335,7 +2351,12 @@ class TUI:
 
         gw = snap.gateway_ping
         if gw:
-            gw_suffix = "HTTPS up" if snap.gateway_https_reachable else "HTTPS down"
+            if snap.gateway_https_reachable:
+                gw_suffix = "HTTPS up"
+            elif self.collector.sys_info.gateway_na_label:
+                gw_suffix = self.collector.sys_info.gateway_na_label
+            else:
+                gw_suffix = "HTTPS down"
             row("Gateway (ICMP)", gw.get("avg_ms", 0), gw.get("loss_pct", 0),
                 gw.get("min_ms", 0), gw.get("max_ms", 0), suffix=gw_suffix)
         row(f"{self.collector.sys_info.api_label} (HTTPS)", snap.api_latency_ms)
@@ -2881,7 +2902,12 @@ def run_report(json_mode: bool = False):
 
     gw = snap.gateway_ping
     if gw:
-        gw_https = f"{GREEN}HTTPS up{RESET}" if snap.gateway_https_reachable else f"{RED}HTTPS down{RESET}"
+        if snap.gateway_https_reachable:
+            gw_https = f"{GREEN}HTTPS up{RESET}"
+        elif sys_info.gateway_na_label:
+            gw_https = f"{DIM}{sys_info.gateway_na_label}{RESET}"
+        else:
+            gw_https = f"{RED}HTTPS down{RESET}"
         print(f"  {DIM}{'Gateway (ICMP)':<22}{RESET} {_fmt_lat(gw.get('avg_ms',0))}  loss {gw.get('loss_pct',0):.1f}%  {gw_https}")
     print(f"  {DIM}{(sys_info.api_label + ' (HTTPS)'):<22}{RESET} {_fmt_lat(snap.api_latency_ms)}")
     print(f"  {DIM}{'Squid Proxy (HTTP)':<22}{RESET} {_fmt_lat(snap.proxy_latency_ms)}")
