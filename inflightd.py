@@ -14,6 +14,7 @@ Usage:
 import argparse
 import collections
 import curses
+import ipaddress
 import json
 import math
 import os
@@ -27,6 +28,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 import math
@@ -94,6 +96,29 @@ def http_get_json(url: str, timeout: float = 5.0) -> tuple[Optional[dict], float
         except json.JSONDecodeError:
             pass
     return None, elapsed
+
+
+def resolves_private(host: str) -> bool:
+    """True if host resolves to a private/loopback/link-local address.
+
+    Onboard IFE hosts are DNS-hijacked to RFC1918 space (e.g. 10.x); the same
+    hostnames resolve to routable public IPs on the ground. Gating network
+    probes on this keeps detection from beaconing to (or stalling on) public
+    servers when you're not actually on the aircraft."""
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError, UnicodeError):
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +322,8 @@ class SystemInfo:
     local_ip: str = ""
     subnet: str = ""
     pac_wisp_url: str = ""
+    api_label: str = "PAC API"
+    gateway_na_label: str = ""
 
 
 @dataclass
@@ -410,9 +437,25 @@ def _detect_captive_portal() -> tuple[str, str, str]:
                 via = resp.headers.get("Via", "")
                 if "squid" in via.lower():
                     proxy_info = f"Squid ({via.split(',')[-1].strip()})"
+                # urlopen transparently follows redirects, so on a hijacked
+                # network the captive probe lands ON the portal page and the
+                # Location header is already consumed — the portal is the final
+                # URL. (FlyNet/BoardConnect 302s captive.apple.com to
+                # captive.boardconnect.aero.) Fall back to a body check for
+                # portals that MITM the probe at the same URL.
                 location = resp.headers.get("Location", "")
                 if location and location != test_url:
                     portal_url = location
+                elif final_url and final_url.rstrip("/") != test_url.rstrip("/"):
+                    portal_url = final_url
+                elif "captive.apple.com" in test_url:
+                    body = resp.read(4096).decode("utf-8", errors="replace")
+                    # Apple's unmolested body is exactly
+                    # "<HTML><HEAD><TITLE>Success</TITLE></HEAD>...". Match that
+                    # marker, not a bare "Success", so a portal page that merely
+                    # contains the word isn't treated as the genuine response.
+                    if "<TITLE>Success</TITLE>" not in body:
+                        portal_url = final_url or test_url
         except urllib.error.HTTPError as e:
             # 302/303 redirects to portal
             location = e.headers.get("Location", "") if e.headers else ""
@@ -482,6 +525,19 @@ class Provider:
 
     name: str = "Unknown"
     hardware: str = ""
+    # Label for the api_base latency row in the UI. Defaults to "PAC API" so
+    # systems other than FlyNet keep the original wording (additive change).
+    api_label: str = "PAC API"
+    # Whether the DHCP gateway is expected to host a web/captive server. Defaults
+    # True, preserving the original behavior: a gateway dead on both ICMP and
+    # HTTPS is reported as a critical outage. Providers whose gateway runs no web
+    # server (the portal lives on other onboard hosts) set this False, so a
+    # silent gateway with working services is reported as info instead.
+    gateway_serves_web: bool = True
+    # Concise display name for UI labels (falls back to name if unset). Used to
+    # build the gateway's calm "n/a on {short_name}" status, shown in place of
+    # the red "HTTPS down"/"unreachable" when gateway_serves_web is False.
+    short_name: str = ""
     discovery_domains: list[str] = []  # used as candidate hosts by --probe / --probe-deep
 
     def detect(self, sig: NetworkSignals) -> Optional[Match]:
@@ -519,7 +575,9 @@ class Provider:
 
 class PanasonicProvider(Provider):
     name = "Panasonic Avionics"
+    short_name = "Panasonic"
     hardware = "Matsushita/Panasonic Avionics"
+    api_label = "PAC API"
     api_base = "https://api.airpana.com/inflight/services"
     oui_prefixes = ["00:0d:2e"]  # Matsushita / Panasonic Avionics
 
@@ -656,110 +714,172 @@ class PanasonicProvider(Provider):
 
 
 # ---------------------------------------------------------------------------
-# Lufthansa Group FlyNet — SWISS, Lufthansa, Austrian, Eurowings
-# (Detection + parser stubs; not yet verified on a live aircraft.)
+# Lufthansa Group FlyNet — Lufthansa, SWISS, Austrian, Eurowings, Edelweiss
+#
+# Hardware: Lufthansa Systems / Lufthansa Technik "BoardConnect" — the FlyNet®
+# web app (an Angular SPA using the "maui-components" design system). Short-haul
+# Continental aircraft ride the European Aviation Network (EAN: Deutsche Telekom
+# LTE-to-ground + Inmarsat S-band); long-haul uses Ka-band satellite.
+#
+# Verified live on Lufthansa, running BoardConnect OS 8 (FlyNet frontend
+# v0.35.4). The onboard DNS hijacks www.lufthansa-flynet.com to a private
+# server (10.x) and Apple's captive probe 302-redirects to
+# captive.boardconnect.aero. Flight + position + connectivity all come from
+# one endpoint: GET /fapi/flightData.
 # ---------------------------------------------------------------------------
 
 class FlynetProvider(Provider):
     name = "Lufthansa Group FlyNet"
-    hardware = "Deutsche Telekom / EAN or Inmarsat Ka"
-    ssids = ["telekom_flynet", "flynet", "lufthansa flynet", "swiss connect", "swissconnect"]
-    discovery_domains = ["lufthansa-flynet.com", "flynet.lufthansa.com",
-                         "wlan.onboard.lufthansa.com",
-                         "swissconnect.com", "www.swissconnect.com",
-                         "portal.swissconnect.com", "api.swissconnect.com"]
+    hardware = "Lufthansa Systems BoardConnect (EAN / Inmarsat)"
+    api_label = "FlyNet API"
+    short_name = "FlyNet"
+    # BoardConnect's DHCP gateway runs no web server — the portal and internet
+    # live on other onboard hosts — so a silent gateway is not an outage.
+    gateway_serves_web = False
+    # Distinctive SSID tokens, matched whole (not as substrings) so generic
+    # names don't false-positive — e.g. "Swisscom"/"Swiss Re" must NOT look like
+    # the airline "SWISS", and a German "Telekom" home router must NOT match.
+    # Bare airline names (swiss/austrian/lufthansa) are intentionally excluded;
+    # the captive redirect and DNS search domain cover those. macOS withholds
+    # the SSID without Location permission, so this is corroborating, not
+    # required. ("Telekom_FlyNet" still matches via its "flynet" token.)
+    ssid_tokens = {"flynet", "boardconnect", "eurowings", "edelweiss"}
+    # Onboard hosts the aircraft DNS points at a private server. www first: the
+    # apex 302-redirects, only www serves the app + API with a 200.
     api_base_candidates = [
         "https://www.lufthansa-flynet.com",
+        "https://lufthansa-flynet.com",
         "https://wlan.onboard.lufthansa.com",
         "https://flynet.lufthansa.com",
+        "https://www.swissconnect.com",
     ]
-    flight_paths = [
-        "/api/flightData", "/api/v1/flightData",
-        "/api/v1/flight-info", "/api/flight", "/flightInfo",
-    ]
-    connectivity_paths = ["/api/connectivity", "/api/v1/connectivity",
-                          "/api/status", "/api/v1/status", "/api/network"]
+    discovery_domains = ["captive.boardconnect.aero", "boardconnect.aero",
+                         "www.lufthansa-flynet.com", "lufthansa-flynet.com",
+                         "wlan.onboard.lufthansa.com", "flynet.lufthansa.com",
+                         "www.swissconnect.com", "swissconnect.com"]
+    # /fapi = onboard "flight API". flightData is the canonical path; the others
+    # are tolerated in case the BoardConnect build differs across the fleet.
+    flight_paths = ["/fapi/flightData", "/fapi/flightdata", "/flightdata"]
+    # Gateway MAC OUI observed once on EAN hardware — weak, corroborating only.
+    oui_prefixes = ["00:e0:4b"]
     airlines_by_prefix = {
-        "LX": "SWISS", "LH": "Lufthansa", "OS": "Austrian Airlines",
-        "EW": "Eurowings", "WK": "Edelweiss Air",
+        "LH": "Lufthansa", "LX": "SWISS", "OS": "Austrian Airlines",
+        "EW": "Eurowings", "WK": "Edelweiss Air", "EN": "Air Dolomiti",
     }
+    _FLIGHT_TTL = 5.0  # seconds; coalesces the per-cycle flight + connectivity reads
+
+    _PROBE_UNSET = object()  # sentinel: api-base probe hasn't run yet this process
+
+    def __init__(self):
+        self._probed_base = self._PROBE_UNSET
+        self._flight_cache = None  # (monotonic_ts, api_base, data)
 
     def detect(self, sig: NetworkSignals) -> Optional[Match]:
         confidence = 0
         portal_url = ""
-        if sig.ssid.lower().strip() in self.ssids:
+        # Captive-portal redirect to BoardConnect is the strongest signal that
+        # needs no SSID / Location permission. captive.apple.com 302s here.
+        pu = sig.portal_url.lower()
+        if "boardconnect.aero" in pu:
             confidence += 50
-        dns = sig.dns_domain.lower()
-        if any(d in dns for d in ["flynet", "telekom", "lufthansa"]):
+            portal_url = sig.portal_url
+        elif any(d in pu for d in ("flynet", "lufthansa", "swissconnect")):
             confidence += 40
-        if sig.portal_url:
-            for d in self.discovery_domains:
-                if d in sig.portal_url:
-                    confidence += 40
-                    portal_url = sig.portal_url
-                    break
-
+            portal_url = sig.portal_url
+        # DNS search domain (often absent — the observed EAN aircraft pushed none).
+        dns = sig.dns_domain.lower()
+        if any(d in dns for d in ("flynet", "telekom", "lufthansa", "boardconnect")):
+            confidence += 40
+        # SSID — match whole tokens, not substrings (may be empty under macOS
+        # privacy). Tokenizing stops "Swisscom" from matching the airline name.
+        ssid = sig.ssid.lower().strip()
+        if ssid and set(re.split(r"[^a-z0-9]+", ssid)) & self.ssid_tokens:
+            confidence += 50
+        # ARP hostname hint.
+        for c in sig.arp_clients:
+            if any(h in c.get("hostname", "").lower() for h in ("boardconnect", "flynet")):
+                confidence += 20
+                break
+        # Gateway MAC OUI (weak; one observation on EAN hardware).
+        if sig.gateway_mac_oui in self.oui_prefixes:
+            confidence += 25
+        # Last resort: nothing cheap matched, so ask the onboard flight API
+        # directly. Definitive, but it touches the network, so it's gated to
+        # confidence 0 AND to hosts that resolve to a private IP (see
+        # _probe_api_base) — that keeps it from beaconing to public Lufthansa /
+        # SWISS servers, or stalling on a blackholed captive, when you're not on
+        # the aircraft.
+        if confidence == 0 and self._probe_api_base() is not None:
+            confidence += 60
         if confidence == 0:
             return None
         return Match(confidence=min(confidence, 100), portal_url=portal_url)
 
     def discover_api_base(self, sig: NetworkSignals) -> Optional[str]:
+        return self._probe_api_base()
+
+    def _probe_api_base(self) -> Optional[str]:
+        """First onboard host (resolving to a private IP) whose flight API
+        returns a flight JSON. Cached, so detect() and discover_api_base()
+        don't each pay a full sweep. Public-resolving candidates are skipped:
+        the onboard hosts are DNS-hijacked to RFC1918 space on the aircraft."""
+        if self._probed_base is not self._PROBE_UNSET:
+            return self._probed_base
+        result = None
         for base in self.api_base_candidates:
-            for path in ("/api/flightData", "/api/v1/flightData"):
-                code, _, _ = http_get(f"{base}{path}", timeout=3)
-                if code == 200:
-                    return base
-        return None
+            host = urllib.parse.urlsplit(base).hostname
+            if not resolves_private(host):
+                continue
+            if self._flight_json(base) is not None:
+                result = base
+                break
+        self._probed_base = result
+        return result
 
     def post_detect(self, info: SystemInfo, sig: NetworkSignals) -> None:
-        # Fall back to any reachable known portal if we still don't have one
         if not info.portal_url:
-            for domain in self.discovery_domains:
-                code, _, _ = http_get(f"https://{domain}/", timeout=5)
-                if code and code != 0:
-                    info.portal_url = f"https://{domain}"
-                    break
+            info.portal_url = sig.portal_url or "https://captive.boardconnect.aero"
+
+    # ---- flight + connectivity both come from /fapi/flightData ----
+
+    def _flight_json(self, api_base: str) -> Optional[dict]:
+        # fetch_flight and fetch_connectivity both want this payload each cycle;
+        # memoize briefly so one collect cycle hits the onboard API once, not
+        # twice (and both reads see a consistent snapshot). TTL < collect
+        # interval, so the next cycle still refreshes.
+        cached = self._flight_cache
+        if cached is not None:
+            ts, base, data = cached
+            if base == api_base and (time.monotonic() - ts) < self._FLIGHT_TTL:
+                return data
+        data = self._fetch_flight_json(api_base)
+        self._flight_cache = (time.monotonic(), api_base, data)
+        return data
+
+    def _fetch_flight_json(self, api_base: str) -> Optional[dict]:
+        for path in self.flight_paths:
+            data, _ = http_get_json(f"{api_base}{path}", timeout=4)
+            if isinstance(data, dict) and (data.get("flightNumber") or data.get("flightPhase")
+                                           or data.get("aircraftRegistration")):
+                return data
+        return None
 
     def fetch_flight(self, api_base: str) -> Optional[FlightData]:
-        for path in self.flight_paths:
-            data, _ = http_get_json(f"{api_base}{path}")
-            if data:
-                return self._parse_flight(data)
-
-        # Some FlyNet portals embed flight data in the main page as JSON
-        code, body, _ = http_get(api_base, timeout=5)
-        if code == 200 and body:
-            for m in re.finditer(r'(?:flightData|flightInfo|flight_data)\s*[=:]\s*(\{[^;]{20,2000}\})', body):
-                try:
-                    data = json.loads(m.group(1))
-                    fd = self._parse_flight(data)
-                    if fd and fd.flight_number:
-                        return fd
-                except (json.JSONDecodeError, ValueError):
-                    continue
-        return None
+        data = self._flight_json(api_base)
+        return self._parse_flight(data) if data else None
 
     def fetch_connectivity(self, api_base: str) -> Optional[ConnectivityStatus]:
-        for path in self.connectivity_paths:
-            data, _ = http_get_json(f"{api_base}{path}")
-            if data:
-                cs = ConnectivityStatus()
-                cs.internet_connectivity = bool(data.get("connected") or data.get("online")
-                                                or data.get("internetAvailable") or True)
-                cs.global_conn_enabled = bool(data.get("enabled") or data.get("serviceAvailable")
-                                              or True)
-                return cs
-        # If portal is reachable at all, connectivity is likely up
-        code, _, _ = http_get(api_base, timeout=3)
-        if code and code < 500:
-            cs = ConnectivityStatus()
-            cs.internet_connectivity = True
-            cs.global_conn_enabled = True
-            return cs
-        return None
+        data = self._flight_json(api_base)
+        if not data:
+            return None
+        cs = ConnectivityStatus()
+        cs.internet_connectivity = bool(data.get("internetAvailable"))
+        # IFCinstalled = in-flight connectivity hardware present and provisioned.
+        cs.global_conn_enabled = bool(data.get("IFCinstalled", data.get("internetAvailable")))
+        return cs
 
     def airline_from_flight_number(self, flight_number: str) -> str:
-        return self.airlines_by_prefix.get(flight_number[:2], "")
+        return self.airlines_by_prefix.get(flight_number[:2].upper(), "")
 
     @staticmethod
     def _num(d: dict, *keys) -> float:
@@ -772,47 +892,60 @@ class FlynetProvider(Provider):
                     continue
         return 0
 
+    @staticmethod
+    def _hhmm_to_min(value) -> int:
+        """Parse a BoardConnect duration to minutes. Handles "HH:MM" (e.g.
+        "02:05" -> 125) and bare numbers (some fleet builds send integer
+        minutes, e.g. 125 -> 125). Returns 0 for anything unparseable."""
+        if value is None:
+            return 0
+        s = str(value).strip()
+        try:
+            if ":" in s:
+                h, m = s.split(":")[:2]
+                return int(h) * 60 + int(m)
+            return int(float(s))  # bare numeric: already minutes
+        except (ValueError, AttributeError):
+            return 0
+
     def _parse_flight(self, data: dict) -> Optional[FlightData]:
-        """Parse FlyNet flight data — handles multiple known JSON shapes."""
+        """Parse a BoardConnect /fapi/flightData payload. Field names verified
+        live against a FlyNet (BoardConnect) aircraft — see the header comment."""
         if not data:
             return None
+        orig = data.get("orig") if isinstance(data.get("orig"), dict) else {}
+        dest = data.get("dest") if isinstance(data.get("dest"), dict) else {}
         fd = FlightData()
-        fd.flight_number = (data.get("flightNumber") or data.get("flight_number")
-                            or data.get("fn") or "")
-        fd.departure_iata = (data.get("departureAirportCode") or data.get("departure")
-                             or data.get("dep") or data.get("origin", {}).get("code", "") or "")
-        fd.destination_iata = (data.get("arrivalAirportCode") or data.get("destination")
-                               or data.get("dst") or data.get("destination", {}).get("code", "") or "")
-        fd.aircraft_type = data.get("aircraftType") or data.get("aircraft_type") or ""
-        fd.tail_number = data.get("tailNumber") or data.get("registration") or ""
+        fd.flight_number = str(data.get("flightNumber") or "")
+        fd.departure_iata = str(orig.get("code") or "")
+        fd.destination_iata = str(dest.get("code") or "")
+        fd.aircraft_type = str(data.get("aircraftType") or "")
+        fd.tail_number = str(data.get("aircraftRegistration") or "")
 
-        fd.ground_speed_kts = int(self._num(data, "groundSpeed", "ground_speed", "speed") or 0)
-        fd.altitude_ft = int(self._num(data, "altitude", "altitudeFeet") or 0)
-        fd.heading_deg = int(self._num(data, "heading", "trueHeading") or 0)
-        fd.outside_temp_c = int(self._num(data, "outsideTemperature", "oat", "temperature") or 0)
+        fd.ground_speed_kts = int(self._num(data, "groundSpeed"))
+        fd.altitude_ft = int(self._num(data, "altitude"))
+        fd.heading_deg = int(self._num(data, "heading"))
+        fd.outside_temp_c = int(self._num(data, "temperature"))
 
-        fd.latitude = self._num(data, "latitude", "lat") or 0.0
-        fd.longitude = self._num(data, "longitude", "lng", "lon") or 0.0
-        pos = data.get("position") or data.get("currentPosition") or {}
-        if isinstance(pos, dict):
-            fd.latitude = fd.latitude or self._num(pos, "latitude", "lat") or 0.0
-            fd.longitude = fd.longitude or self._num(pos, "longitude", "lng", "lon") or 0.0
+        fd.latitude = self._num(data, "lat")
+        fd.longitude = self._num(data, "lon")
+        fd.departure_lat = self._num(orig, "lat")
+        fd.departure_lon = self._num(orig, "lon")
+        fd.destination_lat = self._num(dest, "lat")
+        fd.destination_lon = self._num(dest, "lon")
 
-        fd.time_to_dest_min = int(self._num(data, "timeToDestination", "remainingTime",
-                                           "estimatedTimeRemaining") or 0)
-        fd.distance_to_dest_nm = int(self._num(data, "distanceToDestination", "remainingDistance") or 0)
-        fd.distance_covered_pct = int(self._num(data, "progress", "percentComplete") or 0)
-        fd.estimated_arrival_utc = (data.get("estimatedArrival") or data.get("eta")
-                                    or data.get("arrivalTime") or "")
-
-        dep = data.get("departureAirport") or data.get("origin") or {}
-        if isinstance(dep, dict):
-            fd.departure_lat = self._num(dep, "latitude", "lat") or 0.0
-            fd.departure_lon = self._num(dep, "longitude", "lng", "lon") or 0.0
-        dst = data.get("arrivalAirport") or data.get("destination") or {}
-        if isinstance(dst, dict) and dst.get("latitude") is not None:
-            fd.destination_lat = self._num(dst, "latitude", "lat") or 0.0
-            fd.destination_lon = self._num(dst, "longitude", "lng", "lon") or 0.0
+        fd.distance_to_dest_nm = int(self._num(data, "distDest"))
+        fd.time_to_dest_min = self._hhmm_to_min(data.get("timeDest"))
+        # No progress % in the payload — derive it from elapsed vs remaining
+        # time, but only when both are present. Otherwise a missing field would
+        # read as 0% mid-flight or 100% early, so leave it at 0 (unknown).
+        elapsed = self._hhmm_to_min(data.get("elapsedFlightTime"))
+        if elapsed > 0 and fd.time_to_dest_min > 0:
+            fd.distance_covered_pct = int(round(100 * elapsed / (elapsed + fd.time_to_dest_min)))
+        fd.flight_phase = str(data.get("flightPhase") or "")
+        fd.estimated_arrival_utc = str(data.get("eta") or dest.get("localTimeAtArrival") or "")
+        fd.current_utc_date = str(data.get("utc") or "")
+        fd.weight_on_wheels = bool(data.get("weightOnWheels"))
         return fd
 
 
@@ -858,6 +991,11 @@ def detect_system() -> SystemInfo:
 
     info.provider = best_provider.name
     info.hardware = best_match.hardware or best_provider.hardware
+    info.api_label = best_provider.api_label
+    # A gateway that runs no web server is silent by design — give the UI a calm
+    # "n/a on {provider}" label instead of a red "unreachable"/"HTTPS down".
+    if not best_provider.gateway_serves_web:
+        info.gateway_na_label = f"n/a on {best_provider.short_name or best_provider.name}"
     if best_match.airline:
         info.airline = best_match.airline
     if best_match.portal_url:
@@ -1495,20 +1633,29 @@ def run_probe(sys_info: SystemInfo):
 def detect_issues(snap: Snapshot, sys_info: SystemInfo) -> list[dict]:
     issues = []
     gw = snap.gateway_ping
-    # Don't flag the gateway as unreachable based on ICMP alone — many onboard
-    # APs block ICMP but pass TCP fine. Trust the HTTPS reachability check.
-    if gw and gw.get("loss_pct", 100) > LOSS_BAD and not snap.gateway_https_reachable:
-        issues.append({"severity": "critical", "component": "gateway",
-                       "message": f"Gateway unreachable (ICMP {gw['loss_pct']:.0f}% loss, HTTPS down)",
-                       "detail": "Onboard AP not responding on either ICMP or HTTPS. Hardware issue or system restart."})
-    elif gw and gw.get("loss_pct", 0) > LOSS_WARN and not snap.icmp_blocked:
-        issues.append({"severity": "warning", "component": "gateway",
-                       "message": f"High gateway packet loss ({gw['loss_pct']:.0f}%)",
-                       "detail": "Local WiFi congestion or interference."})
-    if gw and gw.get("avg_ms", 0) > LATENCY_WARN:
-        issues.append({"severity": "warning", "component": "gateway",
-                       "message": f"High gateway latency ({gw['avg_ms']:.0f}ms)",
-                       "detail": "Onboard router overloaded."})
+    # Gateway-reachability checks only make sense when the DHCP gateway is
+    # supposed to answer. On systems whose gateway runs no web server (the
+    # portal and internet live on other onboard hosts, e.g. BoardConnect) the
+    # gateway is silent by design, so it carries no diagnostic signal — skip the
+    # whole cluster. Real outages still surface via the connectivity / external
+    # / throughput checks below. Default keeps the original behavior unchanged.
+    prov = _provider_for(sys_info.provider)
+    gateway_serves_web = prov is None or prov.gateway_serves_web
+    if gateway_serves_web:
+        # Don't flag the gateway as unreachable based on ICMP alone — many
+        # onboard APs block ICMP but pass TCP fine. Trust the HTTPS check.
+        if gw and gw.get("loss_pct", 100) > LOSS_BAD and not snap.gateway_https_reachable:
+            issues.append({"severity": "critical", "component": "gateway",
+                           "message": f"Gateway unreachable (ICMP {gw['loss_pct']:.0f}% loss, HTTPS down)",
+                           "detail": "Onboard AP not responding on either ICMP or HTTPS. Hardware issue or system restart."})
+        elif gw and gw.get("loss_pct", 0) > LOSS_WARN and not snap.icmp_blocked:
+            issues.append({"severity": "warning", "component": "gateway",
+                           "message": f"High gateway packet loss ({gw['loss_pct']:.0f}%)",
+                           "detail": "Local WiFi congestion or interference."})
+        if gw and gw.get("avg_ms", 0) > LATENCY_WARN:
+            issues.append({"severity": "warning", "component": "gateway",
+                           "message": f"High gateway latency ({gw['avg_ms']:.0f}ms)",
+                           "detail": "Onboard router overloaded."})
     # Surface the ICMP-blocked state as informational so the user understands the loss numbers
     if snap.icmp_blocked:
         issues.append({"severity": "info", "component": "network",
@@ -1925,7 +2072,10 @@ class TUI:
         self._collect_thread: Optional[threading.Thread] = None
         self._scroll_offset = 0
 
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)  # ERRs on terminals that can't hide the cursor
+        except curses.error:
+            pass
         curses.use_default_colors()
         self._init_colors()
         self.scr.nodelay(True)
@@ -2175,6 +2325,11 @@ class TUI:
             else:
                 gw_str = "HTTPS reachable"
                 gw_attr = self._color(2)
+        elif self.collector.sys_info.gateway_na_label:
+            # Gateway is silent by design on this system — show a calm label
+            # instead of a red "unreachable"/"HTTPS down".
+            gw_str = self.collector.sys_info.gateway_na_label
+            gw_attr = curses.A_DIM
         elif gw_ms > 0:
             gw_str = f"{gw_ms:.0f}ms (ICMP, HTTPS down)"
             gw_attr = self._color(3)
@@ -2182,7 +2337,7 @@ class TUI:
             gw_str = "unreachable"
             gw_attr = self._color(4, bold=True)
         y = self._draw_kv(y, "Gateway", gw_str, gw_attr)
-        y = self._draw_kv(y, "PAC API", f"{snap.api_latency_ms:.0f}ms", self._latency_attr(snap.api_latency_ms))
+        y = self._draw_kv(y, self.collector.sys_info.api_label, f"{snap.api_latency_ms:.0f}ms", self._latency_attr(snap.api_latency_ms))
         y = self._draw_kv(y, "Squid Proxy", f"{snap.proxy_latency_ms:.0f}ms", self._latency_attr(snap.proxy_latency_ms))
         y = self._draw_kv(y, "External (Google)", f"{snap.external_latency_ms:.0f}ms",
                           self._latency_attr(snap.external_latency_ms))
@@ -2274,10 +2429,15 @@ class TUI:
 
         gw = snap.gateway_ping
         if gw:
-            gw_suffix = "HTTPS up" if snap.gateway_https_reachable else "HTTPS down"
+            if snap.gateway_https_reachable:
+                gw_suffix = "HTTPS up"
+            elif self.collector.sys_info.gateway_na_label:
+                gw_suffix = self.collector.sys_info.gateway_na_label
+            else:
+                gw_suffix = "HTTPS down"
             row("Gateway (ICMP)", gw.get("avg_ms", 0), gw.get("loss_pct", 0),
                 gw.get("min_ms", 0), gw.get("max_ms", 0), suffix=gw_suffix)
-        row("PAC API (HTTPS)", snap.api_latency_ms)
+        row(f"{self.collector.sys_info.api_label} (HTTPS)", snap.api_latency_ms)
         if snap.portal_latency_ms > 0:
             row("Portal (HTTPS)", snap.portal_latency_ms)
         row("Squid Proxy (HTTP)", snap.proxy_latency_ms)
@@ -2705,17 +2865,22 @@ class TUI:
         last_collect = 0
 
         while self.running:
-            now = time.time()
+            try:
+                now = time.time()
 
-            # Trigger collection at interval
-            if now - last_collect >= self.interval:
-                self.trigger_collect()
-                last_collect = now
+                # Trigger collection at interval
+                if now - last_collect >= self.interval:
+                    self.trigger_collect()
+                    last_collect = now
 
-            self.draw()
+                self.draw()
 
-            ch = self.scr.getch()
-            self.handle_key(ch)
+                ch = self.scr.getch()
+                self.handle_key(ch)
+            except KeyboardInterrupt:
+                # Ctrl-C quits cleanly, same as pressing 'q' — the session is
+                # still saved on the way out by curses_main.
+                self.running = False
 
 
 # ---------------------------------------------------------------------------
@@ -2820,9 +2985,14 @@ def run_report(json_mode: bool = False):
 
     gw = snap.gateway_ping
     if gw:
-        gw_https = f"{GREEN}HTTPS up{RESET}" if snap.gateway_https_reachable else f"{RED}HTTPS down{RESET}"
+        if snap.gateway_https_reachable:
+            gw_https = f"{GREEN}HTTPS up{RESET}"
+        elif sys_info.gateway_na_label:
+            gw_https = f"{DIM}{sys_info.gateway_na_label}{RESET}"
+        else:
+            gw_https = f"{RED}HTTPS down{RESET}"
         print(f"  {DIM}{'Gateway (ICMP)':<22}{RESET} {_fmt_lat(gw.get('avg_ms',0))}  loss {gw.get('loss_pct',0):.1f}%  {gw_https}")
-    print(f"  {DIM}{'PAC API (HTTPS)':<22}{RESET} {_fmt_lat(snap.api_latency_ms)}")
+    print(f"  {DIM}{(sys_info.api_label + ' (HTTPS)'):<22}{RESET} {_fmt_lat(snap.api_latency_ms)}")
     print(f"  {DIM}{'Squid Proxy (HTTP)':<22}{RESET} {_fmt_lat(snap.proxy_latency_ms)}")
     print(f"  {DIM}{'External (HTTPS)':<22}{RESET} {_fmt_lat(snap.external_latency_ms)}")
     print(f"  {DIM}{'DNS (google.com)':<22}{RESET} {_fmt_lat(snap.dns_resolve_ms)}")
@@ -2928,4 +3098,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Non-TUI paths (--report / --probe) and any interrupt before the TUI
+        # loop: exit without dumping a traceback. 130 is the conventional
+        # exit code for SIGINT.
+        print("\ninflightd: interrupted.")
+        sys.exit(130)
