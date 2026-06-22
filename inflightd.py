@@ -499,6 +499,12 @@ class Provider:
     # Label for the api_base latency row in the UI. Defaults to "PAC API" so
     # systems other than FlyNet keep the original wording (additive change).
     api_label: str = "PAC API"
+    # Whether the DHCP gateway is expected to host a web/captive server. Defaults
+    # True, preserving the original behavior: a gateway dead on both ICMP and
+    # HTTPS is reported as a critical outage. Providers whose gateway runs no web
+    # server (the portal lives on other onboard hosts) set this False, so a
+    # silent gateway with working services is reported as info instead.
+    gateway_serves_web: bool = True
     discovery_domains: list[str] = []  # used as candidate hosts by --probe / --probe-deep
 
     def detect(self, sig: NetworkSignals) -> Optional[Match]:
@@ -692,6 +698,9 @@ class FlynetProvider(Provider):
     name = "Lufthansa Group FlyNet"
     hardware = "Lufthansa Systems BoardConnect (EAN / Inmarsat)"
     api_label = "FlyNet API"
+    # BoardConnect's DHCP gateway runs no web server — the portal and internet
+    # live on other onboard hosts — so a silent gateway is not an outage.
+    gateway_serves_web = False
     # SSID substrings, matched loosely. macOS withholds the SSID without Location
     # permission, so this is corroborating — never required for a match.
     ssid_hints = ["flynet", "boardconnect", "telekom_flynet", "lufthansa",
@@ -1535,20 +1544,29 @@ def run_probe(sys_info: SystemInfo):
 def detect_issues(snap: Snapshot, sys_info: SystemInfo) -> list[dict]:
     issues = []
     gw = snap.gateway_ping
-    # Don't flag the gateway as unreachable based on ICMP alone — many onboard
-    # APs block ICMP but pass TCP fine. Trust the HTTPS reachability check.
-    if gw and gw.get("loss_pct", 100) > LOSS_BAD and not snap.gateway_https_reachable:
-        issues.append({"severity": "critical", "component": "gateway",
-                       "message": f"Gateway unreachable (ICMP {gw['loss_pct']:.0f}% loss, HTTPS down)",
-                       "detail": "Onboard AP not responding on either ICMP or HTTPS. Hardware issue or system restart."})
-    elif gw and gw.get("loss_pct", 0) > LOSS_WARN and not snap.icmp_blocked:
-        issues.append({"severity": "warning", "component": "gateway",
-                       "message": f"High gateway packet loss ({gw['loss_pct']:.0f}%)",
-                       "detail": "Local WiFi congestion or interference."})
-    if gw and gw.get("avg_ms", 0) > LATENCY_WARN:
-        issues.append({"severity": "warning", "component": "gateway",
-                       "message": f"High gateway latency ({gw['avg_ms']:.0f}ms)",
-                       "detail": "Onboard router overloaded."})
+    # Gateway-reachability checks only make sense when the DHCP gateway is
+    # supposed to answer. On systems whose gateway runs no web server (the
+    # portal and internet live on other onboard hosts, e.g. BoardConnect) the
+    # gateway is silent by design, so it carries no diagnostic signal — skip the
+    # whole cluster. Real outages still surface via the connectivity / external
+    # / throughput checks below. Default keeps the original behavior unchanged.
+    prov = _provider_for(sys_info.provider)
+    gateway_serves_web = prov is None or prov.gateway_serves_web
+    if gateway_serves_web:
+        # Don't flag the gateway as unreachable based on ICMP alone — many
+        # onboard APs block ICMP but pass TCP fine. Trust the HTTPS check.
+        if gw and gw.get("loss_pct", 100) > LOSS_BAD and not snap.gateway_https_reachable:
+            issues.append({"severity": "critical", "component": "gateway",
+                           "message": f"Gateway unreachable (ICMP {gw['loss_pct']:.0f}% loss, HTTPS down)",
+                           "detail": "Onboard AP not responding on either ICMP or HTTPS. Hardware issue or system restart."})
+        elif gw and gw.get("loss_pct", 0) > LOSS_WARN and not snap.icmp_blocked:
+            issues.append({"severity": "warning", "component": "gateway",
+                           "message": f"High gateway packet loss ({gw['loss_pct']:.0f}%)",
+                           "detail": "Local WiFi congestion or interference."})
+        if gw and gw.get("avg_ms", 0) > LATENCY_WARN:
+            issues.append({"severity": "warning", "component": "gateway",
+                           "message": f"High gateway latency ({gw['avg_ms']:.0f}ms)",
+                           "detail": "Onboard router overloaded."})
     # Surface the ICMP-blocked state as informational so the user understands the loss numbers
     if snap.icmp_blocked:
         issues.append({"severity": "info", "component": "network",
