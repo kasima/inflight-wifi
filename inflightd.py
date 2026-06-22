@@ -2865,17 +2865,22 @@ class TUI:
         last_collect = 0
 
         while self.running:
-            now = time.time()
+            try:
+                now = time.time()
 
-            # Trigger collection at interval
-            if now - last_collect >= self.interval:
-                self.trigger_collect()
-                last_collect = now
+                # Trigger collection at interval
+                if now - last_collect >= self.interval:
+                    self.trigger_collect()
+                    last_collect = now
 
-            self.draw()
+                self.draw()
 
-            ch = self.scr.getch()
-            self.handle_key(ch)
+                ch = self.scr.getch()
+                self.handle_key(ch)
+            except KeyboardInterrupt:
+                # Ctrl-C quits cleanly, same as pressing 'q' — the session is
+                # still saved on the way out by curses_main.
+                self.running = False
 
 
 # ---------------------------------------------------------------------------
@@ -3093,4 +3098,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Non-TUI paths (--report / --probe) and any interrupt before the TUI
+        # loop: exit without dumping a traceback. 130 is the conventional
+        # exit code for SIGINT.
+        print("\ninflightd: interrupted.")
+        sys.exit(130)
